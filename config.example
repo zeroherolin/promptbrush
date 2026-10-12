@@ -1,0 +1,8 @@
+# Copy to .env and fill in: cp config.example .env
+# .env is listed in .gitignore; environment variables of the same name take precedence over it.
+
+# Required: API key
+PROMPTBRUSH_API_KEY=
+
+# Optional: OpenAI-compatible base URL (up to /v1), default https://api.openai.com/v1
+# PROMPTBRUSH_BASE_URL=https://your-provider.example.com/v1

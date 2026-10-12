@@ -1,0 +1,109 @@
+# promptbrush
+
+**English** | [简体中文](README.zh-CN.md)
+
+Paint with prompts: a single-file CLI and Python library for OpenAI-compatible `/v1/images` APIs. Generate images from a prompt, or edit one or more reference images.
+
+To mark regions in a browser and keep every edit in a version tree, see [brushgraft](https://github.com/zeroherolin/brushgraft), which is built on promptbrush.
+
+```bash
+promptbrush 'a corgi wearing an astronaut helmet, Pixar style'
+promptbrush -i cat.png -i hat.png 'put this hat on this cat'
+```
+
+## Features
+
+- Pass images or a directory with `-i` to edit them; without `-i` it generates.
+- `-n N` sends N single-image requests, 4 at a time, so one failure doesn't cost the others.
+- Network errors, 429, 500–504 and Cloudflare 52x are retried with backoff, waiting as long as `Retry-After` asks (up to a minute).
+- Sizes, reference images and the output directory are checked locally, before anything is paid for.
+- Logs go to stderr; stdout lists only the saved files, one per line.
+- `create_image` returns image bytes for use from Python; see [Python library](#python-library).
+- One file, one dependency (`requests`), Python 3.10+.
+
+## Installation
+
+```bash
+git clone https://github.com/zeroherolin/promptbrush.git
+cd promptbrush
+pip install -e .          # or: pip install git+https://github.com/zeroherolin/promptbrush.git
+cp config.example .env    # then fill in your API key
+```
+
+| Variable | Description |
+| --- | --- |
+| `PROMPTBRUSH_API_KEY` | Required |
+| `PROMPTBRUSH_BASE_URL` | Base URL up to `/v1`; default `https://api.openai.com/v1` |
+
+Environment variables override `.env`, which is read from the directory of `promptbrush.py`. When installed into site-packages, use environment variables.
+
+## Usage
+
+```text
+promptbrush [prompt ...] [-i PATH] [-s SIZE] [-n NUM] [-m MODEL] [-o DIR]
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `prompt` | | Prompt text; read from `prompt.md` next to the script when omitted |
+| `-i, --image` | | Reference image or directory; repeatable; switches to edit mode |
+| `-s, --size` | `1600x1200` | `WIDTHxHEIGHT` or `auto` |
+| `-n, --num` | `1` | Number of images, 1 to 10 |
+| `-m, --model` | `gpt-image-2.5-flare` | Model name |
+| `-o, --output` | `.` | Output directory |
+
+```bash
+promptbrush -s 3840x2160 -n 2 -o out/ 'a misty canal town at dawn'
+promptbrush -i ./refs/ 'a lighthouse in the style of these images'
+promptbrush 'a cat' > saved.txt    # stdout is one saved path per line
+```
+
+Exit codes: `0` at least one image saved, `1` nothing saved or an invalid value (a size, a path), `2` malformed options, `130` Ctrl+C. Set `NO_COLOR` to turn off colored logs.
+
+## Models
+
+Measured in October 2026 on one OpenAI-compatible relay; what's available depends on your provider.
+
+| Model | Time | Output size | Aligned in edits | Notes |
+| --- | --- | --- | --- | --- |
+| `gpt-image-2.5-sunburst` | 40–90s | Exact, ≤4K | Yes | Best quality |
+| `gpt-image-2.5-flare` | 25–45s | Exact, ≤4K | Yes | **Default** |
+| `gpt-image-2` | 20–40s | Aspect only, ~1.57 MP | Yes | Most lenient moderation |
+| `gpt-image-2-vip` | 30–75s | Exact for most sizes, ≤4K | Yes | Only model that respects `mask` |
+| `gpt-image-1.5` | 15–30s | Aspect only, ~1.57 MP | Yes | |
+| `gemini-nano-banana-2.1` | 15–30s | 1024×1024 | No | |
+| `gemini-3-pro-image` | 25–45s | 1024×1024 | No | Nano Banana Pro |
+| `gemini-3.1-flash-image` | 10–20s | 1024×1024 | No | Fastest |
+| `jimeng-4.5` | 40–55s | Aspect only, ~4.15 MP | Yes | Adds an "AI" watermark |
+
+"Aligned" means an edit keeps the original framing, so the result can be compared or pasted back pixel by pixel. `gpt-image-2.5-*` need width and height in multiples of 16, sides ≤ 3840, a ratio ≤ 3:1 and 655,360–8,294,400 pixels; promptbrush checks this locally. The table is also available as `promptbrush.MODELS` and at the end of `--help`.
+
+## Python library
+
+```python
+import promptbrush as pb
+
+gen = pb.create_image("a corgi wearing an astronaut helmet", size="1536x1024")
+
+photo = open("cat.png", "rb").read()
+gen = pb.create_image("give the cat a red knitted hat", images=[photo],
+                      size=pb.fit_size(1600, 1200))  # same aspect as the photo
+open("out.png", "wb").write(gen.images[0])
+```
+
+Each call sends one request, with retries built in. Invalid input raises `ValueError` before anything is sent, API failures (including a response without an image) raise `pb.ImageAPIError` with `.status`, `.code` and `.moderated`, and `with pb.log_sink(callback):` captures the log lines.
+
+## Notes
+
+- A request retried after a timeout or a 524 may be billed for every attempt: the server may have finished the earlier ones.
+- Moderation blocks come as HTTP 451 from the relay measured, as `400 moderation_blocked` from OpenAI; pass rates differ a lot between models.
+
+## Development
+
+```bash
+python -m unittest -v test_promptbrush    # offline, about a second
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,29 @@
+# Private config and credentials
+.env
+.env.*
+
+# Personal prompt (promptbrush.py reads it by default)
+prompt.md
+
+# Generated images (saved to the current directory by default)
+image_*.png
+image_*.jpg
+image_*.webp
+image_*.gif
+image_*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
