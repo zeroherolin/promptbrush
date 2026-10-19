@@ -70,13 +70,13 @@ Measured in October 2026 on one OpenAI-compatible relay; what's available depend
 | `gpt-image-2.5-flare` | 25–45s | Exact, ≤4K | Yes | **Default** |
 | `gpt-image-2` | 20–40s | Aspect only, ~1.57 MP | Yes | Most lenient moderation |
 | `gpt-image-2-vip` | 30–75s | Exact for most sizes, ≤4K | Yes | Only model that respects `mask` |
-| `gpt-image-1.5` | 15–30s | Aspect only, ~1.57 MP | Yes | |
+| `gpt-image-1.5` | 15–30s | Aspect only, ~1.57 MP | Yes | Up to 4 input images |
 | `gemini-nano-banana-2.1` | 15–30s | 1024×1024 | No | |
 | `gemini-3-pro-image` | 25–45s | 1024×1024 | No | Nano Banana Pro |
 | `gemini-3.1-flash-image` | 10–20s | 1024×1024 | No | Fastest |
-| `jimeng-4.5` | 40–55s | Aspect only, ~4.15 MP | Yes | Adds an "AI" watermark |
+| `jimeng-4.5` | 40–55s | Aspect only, ~4.15 MP | Yes | Adds an "AI" watermark; up to 4 input images |
 
-"Aligned" means an edit keeps the original framing, so the result can be compared or pasted back pixel by pixel. `gpt-image-2.5-*` need width and height in multiples of 16, sides ≤ 3840, a ratio ≤ 3:1 and 655,360–8,294,400 pixels; promptbrush checks this locally. The table is also available as `promptbrush.MODELS` and at the end of `--help`.
+"Aligned" means an edit keeps the original framing, so the result can be compared or pasted back pixel by pixel. `gpt-image-2.5-*` need width and height in multiples of 16, sides ≤ 3840, a ratio ≤ 3:1 and 655,360–8,294,400 pixels; promptbrush checks this locally. With 10 input images (the image edited, an annotated copy and 8 references, each named in the prompt by its position), the other models used the reference the prompt named; with more than 4, `gpt-image-1.5` and `jimeng-4.5` took the wrong one, so promptbrush refuses more for them (`check_images`). The table is also available as `promptbrush.MODELS` and at the end of `--help`.
 
 ## Python library
 

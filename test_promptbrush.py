@@ -620,6 +620,14 @@ class TestModels(unittest.TestCase):
                 if info.mask:
                     self.assertTrue(info.aligned)
 
+    def test_input_images_are_limited_where_measured(self):
+        self.assertEqual(pb.MODELS["jimeng-4.5"].images, 4)
+        pb.check_images("jimeng-4.5", 4)
+        with self.assertRaisesRegex(ValueError, "at most 4 input images"):
+            pb.check_images("jimeng-4.5", 5)
+        pb.check_images(pb.DEFAULT_MODEL, pb.MAX_IMAGES)
+        pb.check_images("some-other-model", 50)  # not measured: not checked
+
     def test_listed_in_help(self):
         help_text = pb.build_parser().format_help()
         for name in pb.MODELS:
@@ -1339,6 +1347,19 @@ class TestMain(LogCaptureTestCase):
                 self.assertEqual(gen.call_args.kwargs["size"], size)
                 self.assertEqual(
                     any("exceeds 3:1" in m for m in self.logged("warn")), warns)
+
+    def test_too_many_images_for_the_model_are_refused_before_any_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for k in range(5):
+                path = Path(tmp) / f"{k}.png"
+                path.write_bytes(PNG)
+                paths += ["-i", str(path)]
+            with mock.patch.object(pb, "edit_image") as edit:
+                code = pb.main(["-m", "gpt-image-1.5", *paths, "x"])
+        self.assertEqual(code, 1)
+        edit.assert_not_called()
+        self.assertIn("at most 4 input images", self.logged("error")[0])
 
     def test_strict_model_rejects_bad_size_before_any_request(self):
         with mock.patch.object(pb, "generate_image") as gen, \

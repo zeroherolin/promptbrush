@@ -34,12 +34,12 @@ from pathlib import Path
 
 import requests
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "MODELS", "DEFAULT_MODEL", "DEFAULT_SIZE", "LENIENT_MODERATION_MODEL",
     "ModelInfo", "Generation",
-    "ImageAPIError", "create_image", "check_size", "fit_size",
+    "ImageAPIError", "create_image", "check_images", "check_size", "fit_size",
     "detect_image_ext", "png_dimensions", "log_sink",
 ]
 
@@ -54,6 +54,11 @@ ENV_PREFIX = "PROMPTBRUSH_"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
+# Input images a model was measured to handle, the image edited included: 10 (an image, an
+# annotated copy and 8 references, each named in the prompt) went right with most models
+MAX_IMAGES = 10
+
+
 @dataclass(frozen=True)
 class ModelInfo:
     """Measured model behavior. It depends on the provider; treat it as a guide."""
@@ -63,6 +68,7 @@ class ModelInfo:
                    # result can be compared pixel by pixel or pasted back
     mask: bool     # edits respect the mask: nothing outside its transparent area changes
     note: str = ""
+    images: int = MAX_IMAGES  # input images it handles; more are refused before sending
 
 
 # Mainstream image models verified on one OpenAI-compatible relay service
@@ -77,7 +83,11 @@ class ModelInfo:
 #   - every model can locate the region to change from "original + annotated
 #     copy", and none of them draws the annotations into the result;
 #   - gpt-image-2 occasionally returns two images for a multi-image edit (one
-#     was requested); both are saved.
+#     was requested); both are saved;
+#   - with the image edited, an annotated copy and 8 references (10 images), the
+#     gpt-image-2* and gemini models used the reference the prompt named; with
+#     more than 4, gpt-image-1.5 and jimeng-4.5 took the wrong one, and with 10
+#     gpt-image-1.5 ignored the image edited; jimeng-4.5 turns down more than 6.
 MODELS: dict[str, ModelInfo] = {
     "gpt-image-2.5-sunburst": ModelInfo(
         "40–90s", "exact", True, False,
@@ -89,7 +99,7 @@ MODELS: dict[str, ModelInfo] = {
     "gpt-image-2-vip": ModelInfo(
         "30–75s", "exact", True, True, "most sizes rendered exactly; up to 4K"),
     "gpt-image-1.5": ModelInfo(
-        "15–30s", "aspect", True, False, "~1.57 MP"),
+        "15–30s", "aspect", True, False, "~1.57 MP; up to 4 input images", images=4),
     "gemini-nano-banana-2.1": ModelInfo(
         "15–30s", "fixed", False, False),
     "gemini-3-pro-image": ModelInfo(
@@ -97,7 +107,8 @@ MODELS: dict[str, ModelInfo] = {
     "gemini-3.1-flash-image": ModelInfo(
         "10–20s", "fixed", False, False, "fastest"),
     "jimeng-4.5": ModelInfo(
-        "40–55s", "aspect", True, False, '~4.15 MP; adds an "AI" watermark in a corner'),
+        "40–55s", "aspect", True, False,
+        '~4.15 MP; adds an "AI" watermark in a corner; up to 4 input images', images=4),
 }
 
 # flare is the default: second only to sunburst on every leaderboard and about
@@ -426,6 +437,15 @@ def _size_problems(w: int, h: int) -> list[str]:
         problems.append(f"total pixels must be between {MIN_PIXELS:,} "
                         f"and {MAX_PIXELS:,}")
     return problems
+
+
+def check_images(model: str, count: int) -> None:
+    """Raise ValueError if ``model`` was measured to mishandle ``count`` input images (see
+    ModelInfo.images); unknown models are not checked."""
+    info = MODELS.get(model)
+    if info and count > info.images:
+        raise ValueError(f"{model} handles at most {info.images} input images "
+                         f"(the image edited included), not {count}")
 
 
 def check_size(model: str, size: str) -> None:
@@ -862,6 +882,7 @@ def create_image(
     if mask is not None and detect_image_ext(mask) != ".png":
         raise ValueError("mask must be a PNG image")
     check_size(model, size)
+    check_images(model, len(images))
 
     key = (api_key or load_api_key()).strip()
     if not key.isprintable() or any(c.isspace() for c in key):
@@ -1043,6 +1064,7 @@ def main(argv: list[str]) -> int:
             # dropping reference images: the user meant to edit, and silently
             # changing the request would waste paid credits
             ref_images = find_reference_images(args.image)
+            check_images(args.model, len(ref_images))
             saved = edit_image(prompt, ref_images, **options)
         else:
             saved = generate_image(prompt, **options)
