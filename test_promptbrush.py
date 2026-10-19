@@ -101,10 +101,14 @@ def b64(data: bytes) -> str:
 def fake_response(status=200, *, json_body=None, text=None, headers=None,
                   content=b""):
     """Build a requests.Response stand-in good enough for promptbrush."""
-    resp = mock.Mock(spec=requests.Response)
+    resp = mock.MagicMock(spec=requests.Response)
     resp.status_code = status
     resp.headers = headers or {}
     resp.content = content
+    resp.url = "https://x/"
+    resp.iter_content.side_effect = lambda size=1: iter([content[i:i + size]
+                                                         for i in range(0, len(content), size)])
+    resp.__enter__.return_value = resp
     if json_body is not None:
         resp.text = json.dumps(json_body)
         resp.json.return_value = json_body
@@ -249,6 +253,13 @@ class TestLog(unittest.TestCase):
                if not re.fullmatch(r"\[info\] thread\d x{50}", line)]
         self.assertEqual(bad, [])
 
+    def test_a_failing_sink_never_raises_into_the_request(self):
+        def broken(level, msg):
+            raise RuntimeError("closed")
+        with pb.log_sink(broken), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            pb.log("info", "hello")
+        self.assertIn("log sink failed", err.getvalue())
+
     def test_sink_takes_over_current_thread_only(self):
         got = []
 
@@ -323,6 +334,14 @@ class TestLoadFiles(LogCaptureTestCase):
 
 
 class TestSettings(LogCaptureTestCase):
+    def test_a_blank_environment_variable_leaves_the_env_file_in_charge(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = Path(d) / ".env"
+            env.write_text("PROMPTBRUSH_API_KEY=from-file\n")
+            with mock.patch.object(pb, "ENV_FILE", env), \
+                    mock.patch.dict(os.environ, {"PROMPTBRUSH_API_KEY": "  "}):
+                self.assertEqual(pb.get_setting("API_KEY"), "from-file")
+
     def setUp(self):
         super().setUp()
         self.env_file = self.tmp / ".env"
@@ -527,6 +546,10 @@ class TestParseArgs(unittest.TestCase):
 
 
 class TestCheckSize(LogCaptureTestCase):
+    def test_a_trailing_line_break_is_not_a_size(self):
+        with self.assertRaises(ValueError):
+            pb.check_size(pb.DEFAULT_MODEL, "1024x1024\n")
+
     STRICT = "gpt-image-2.5-flare"
 
     def test_default_model_is_strict(self):
@@ -671,6 +694,9 @@ class TestRequestWithRetry(LogCaptureTestCase):
         patcher = mock.patch.object(pb.time, "sleep")
         self.sleep = patcher.start()
         self.addCleanup(patcher.stop)
+        jitter = mock.patch.object(pb.random, "uniform", return_value=0.0)
+        jitter.start()
+        self.addCleanup(jitter.stop)
 
     def sleeps(self):
         return [c.args[0] for c in self.sleep.call_args_list]
@@ -690,6 +716,44 @@ class TestRequestWithRetry(LogCaptureTestCase):
         self.assertEqual(req.call_count, 3)
         self.assertEqual(self.sleeps(), [2.0, 4.0])
 
+    def test_a_paid_request_that_may_have_been_made_is_sent_again_once(self):
+        # a 524 or a 500 can come after the image was made and billed
+        for status in (500, 504, 524):
+            self.sleep.reset_mock()
+            with mock.patch.object(pb.requests, "request",
+                                   return_value=fake_response(status)) as req:
+                self.assertEqual(pb.request_with_retry("POST", "u").status_code, status)
+            self.assertEqual(req.call_count, 1 + pb.UNCERTAIN_RETRIES)
+        err = requests.exceptions.ReadTimeout("slow")
+        with mock.patch.object(pb.requests, "request", side_effect=err) as req:
+            with self.assertRaises(requests.exceptions.ReadTimeout):
+                pb.request_with_retry("POST", "u")
+        self.assertEqual(req.call_count, 1 + pb.UNCERTAIN_RETRIES)
+        # a download is free: retried as often as it takes
+        with mock.patch.object(pb.requests, "request", side_effect=err) as req:
+            with self.assertRaises(requests.exceptions.ReadTimeout):
+                pb.request_with_retry("GET", "u")
+        self.assertEqual(req.call_count, pb.MAX_RETRIES)
+
+    def test_what_waiting_doesnt_fix_is_not_retried(self):
+        quota = fake_response(429, json_body={"error": {"code": "insufficient_quota"}})
+        for result in (quota, fake_response(525), requests.exceptions.SSLError("cert"),
+                       requests.exceptions.ProxyError("proxy")):
+            with mock.patch.object(pb.requests, "request", side_effect=[result]) as req:
+                if isinstance(result, Exception):
+                    with self.assertRaises(type(result)):
+                        pb.request_with_retry("POST", "u")
+                else:
+                    pb.request_with_retry("POST", "u")
+            self.assertEqual(req.call_count, 1)
+
+    def test_a_connection_never_made_is_retried_freely(self):
+        err = requests.exceptions.ConnectTimeout("no route")
+        with mock.patch.object(pb.requests, "request", side_effect=err) as req:
+            with self.assertRaises(requests.exceptions.ConnectTimeout):
+                pb.request_with_retry("POST", "u")
+        self.assertEqual(req.call_count, pb.MAX_RETRIES)
+
     def test_non_retryable_status_returned_immediately(self):
         with mock.patch.object(pb.requests, "request",
                                return_value=fake_response(400)) as req:
@@ -697,7 +761,7 @@ class TestRequestWithRetry(LogCaptureTestCase):
         self.assertEqual(req.call_count, 1)
 
     def test_exhausted_returns_last_response(self):
-        with mock.patch.object(pb.requests, "request",
+        with mock.patch.object(pb.requests, "request",  # 503: refused, so safe to send again
                                return_value=fake_response(503)) as req:
             self.assertEqual(pb.request_with_retry("POST", "u").status_code, 503)
         self.assertEqual(req.call_count, pb.MAX_RETRIES)
@@ -724,16 +788,15 @@ class TestRequestWithRetry(LogCaptureTestCase):
                requests.exceptions.ChunkedEncodingError("broken"),
                fake_response(200)]
         with mock.patch.object(pb.requests, "request", side_effect=seq):
-            self.assertEqual(pb.request_with_retry("POST", "u").status_code, 200)
+            self.assertEqual(pb.request_with_retry("GET", "u").status_code, 200)
         self.assertEqual(len(self.logged("retry")), 2)
 
     def test_connection_errors_exhausted_raise_last(self):
         err = requests.exceptions.ReadTimeout("slow")
         with mock.patch.object(pb.requests, "request", side_effect=err) as req:
             with self.assertRaises(requests.exceptions.ReadTimeout):
-                pb.request_with_retry("POST", "u")
+                pb.request_with_retry("GET", "u")
         self.assertEqual(req.call_count, pb.MAX_RETRIES)
-        self.assertTrue(self.logged("error"))
 
     def test_other_request_exceptions_not_retried(self):
         err = requests.exceptions.InvalidURL("bad")
@@ -786,8 +849,18 @@ class TestDecodeAndSave(LogCaptureTestCase):
             saved = self.save({"data": [{"url": "http://x/1"}]},
                                     str(self.tmp))
         req.assert_called_once_with("GET", "http://x/1",
-                                    timeout=pb.TIMEOUT_DOWNLOAD)
+                                    timeout=pb.TIMEOUT_DOWNLOAD, stream=True)
         self.assertEqual(Path(saved[0]).read_bytes(), PNG)
+
+    def test_a_download_is_limited_and_kept_to_http(self):
+        big = fake_response(200, content=PNG, headers={"Content-Length": str(1 << 30)})
+        result = {"data": [{"url": "https://x/1.png?sig=SECRET"}, {"url": "file:///etc/passwd"}]}
+        with mock.patch.object(pb.requests, "request", return_value=big):
+            self.assertEqual(self.save(result, str(self.tmp)), [])
+        log = "\n".join(self.logged("error") + self.logged("info"))
+        self.assertIn("too large", log)
+        self.assertIn("not an http(s) link", log)
+        self.assertNotIn("SECRET", log)  # a signed link's signature stays out of the log
 
     def test_url_download_retried_on_transient_failure(self):
         seq = [requests.exceptions.ConnectionError("reset"),
@@ -837,7 +910,7 @@ class TestDecodeAndSave(LogCaptureTestCase):
 
     def test_what_is_not_an_image_is_not_saved(self):
         # an expired link answering with an HTML page; a field of the wrong type
-        page = mock.Mock(status_code=200, content=b"<html>Link expired</html>")
+        page = fake_response(200, content=b"<html>Link expired</html>")
         result = {"data": [{"url": "https://x/1.png"}, {"b64_json": b64(b"mystery")},
                            {"b64_json": {"nested": 1}}, {"b64_json": b64(PNG)}]}
         with mock.patch.object(pb, "request_with_retry", return_value=page):
@@ -845,7 +918,8 @@ class TestDecodeAndSave(LogCaptureTestCase):
         self.assertEqual([Path(p).read_bytes() for p in saved], [PNG])
         errors = self.logged("error")
         self.assertEqual(len(errors), 2)
-        self.assertIn("Link expired", errors[0])
+        self.assertIn("not an image", errors[0])
+        self.assertNotIn("Link expired", errors[0])  # what the page said isn't repeated
 
     def test_empty_data(self):
         self.assertEqual(self.save({"data": []}, str(self.tmp)), [])
@@ -1106,6 +1180,28 @@ class TestCreateImage(LogCaptureTestCase):
 
 
 class TestCreateImageErrors(LogCaptureTestCase):
+    def test_a_key_with_a_line_break_is_trimmed_and_one_with_spaces_refused_unseen(self):
+        with mock.patch.object(pb, "_post_images",
+                               return_value=pb.Generation([PNG], None, 1.0)) as post:
+            pb.create_image("a cat", size="1024x1024", api_key="sk-abc\n", base_url="https://p/v1")
+        self.assertEqual(post.call_args.kwargs["headers"], {"Authorization": "Bearer sk-abc"})
+        with self.assertRaises(ValueError) as exc:
+            pb.create_image("a cat", size="1024x1024", api_key="sk-a bc", base_url="https://p/v1")
+        self.assertNotIn("sk-a", str(exc.exception))
+
+    def test_a_response_whose_images_all_fail_raises_no_image(self):
+        resp = fake_response(200, json_body={"data": [{"url": "ftp://x/1"}], "usage": {}})
+        with mock.patch.object(pb, "request_with_retry", return_value=resp), \
+                self.assertRaises(pb.ImageAPIError) as exc:
+            pb.create_image("a cat", size="1024x1024", api_key="k", base_url="https://p/v1")
+        self.assertEqual(exc.exception.code, pb.NO_IMAGE)
+
+    def test_the_error_pickles(self):
+        import pickle
+        err = pickle.loads(pickle.dumps(pb.ImageAPIError("HTTP 451: no", 451, "x")))
+        self.assertEqual((str(err), err.status, err.code, err.moderated),
+                         ("HTTP 451: no", 451, "x", True))
+
     def test_api_errors_raised_with_status(self):
         cases = [(fake_response(451, json_body={"error": "unsafe"}), 451, True),
                  (fake_response(400, text="bad"), 400, False),

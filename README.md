@@ -15,7 +15,7 @@ promptbrush -i cat.png -i hat.png 'put this hat on this cat'
 
 - Pass images or a directory with `-i` to edit them; without `-i` it generates.
 - `-n N` sends N single-image requests, 4 at a time, so one failure doesn't cost the others.
-- Network errors, 429, 500–504 and Cloudflare 52x are retried with backoff, waiting as long as `Retry-After` asks (up to a minute).
+- Retries with backoff, waiting as long as `Retry-After` asks (up to a minute). A request refused before any work began (no connection, 429, 502, 503, Cloudflare 520–523) is retried up to four times; one that may have been made and billed (a timeout, 500, 504, 524) is sent again once. Certificate and proxy errors, 525/526 and an exhausted quota aren't retried.
 - Sizes, reference images and the output directory are checked locally, before anything is paid for.
 - Logs go to stderr; stdout lists only the saved files, one per line.
 - `create_image` returns image bytes for use from Python; see [Python library](#python-library).
@@ -95,7 +95,8 @@ Each call sends one request, with retries built in. Invalid input raises `ValueE
 
 ## Notes
 
-- A request retried after a timeout or a 524 may be billed for every attempt: the server may have finished the earlier ones.
+- A request sent again after a timeout or a 524 may be billed twice: the server may have finished the first one.
+- An image link in a response is downloaded over http(s) only, up to 64 MB.
 - Moderation blocks come as HTTP 451 from the relay measured, as `400 moderation_blocked` from OpenAI; pass rates differ a lot between models.
 
 ## Development

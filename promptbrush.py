@@ -21,6 +21,7 @@ import base64
 import contextlib
 import math
 import os
+import random
 import re
 import sys
 import threading
@@ -33,7 +34,7 @@ from pathlib import Path
 
 import requests
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "MODELS", "DEFAULT_MODEL", "DEFAULT_SIZE", "LENIENT_MODERATION_MODEL",
@@ -122,7 +123,7 @@ SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Format found by detect_image_ext → MIME type for uploaded reference images
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg",
               ".webp": "image/webp", ".gif": "image/gif"}
-SIZE_PATTERN = re.compile(r"^(auto|[1-9]\d*x[1-9]\d*)$")
+SIZE_PATTERN = re.compile(r"^(auto|[1-9]\d*x[1-9]\d*)\Z")  # \Z: "1024x1024\n" isn't a size
 MAX_ASPECT = 3.0
 # Measured size behavior varies by model:
 #   - gpt-image-2.5-*: renders the -s size exactly and rejects invalid sizes
@@ -141,13 +142,25 @@ MAX_PIXELS = 3840 * 2160
 # Network retries: back off and retry automatically when the server drops the
 # connection, times out or rate-limits
 MAX_RETRIES = 5
-RETRY_BACKOFF = 2.0  # retry k waits RETRY_BACKOFF ** k seconds
+RETRY_BACKOFF = 2.0  # retry k waits RETRY_BACKOFF ** k seconds (plus up to a second)
 MAX_RETRY_AFTER = 60  # upper limit (seconds) for honoring a server's Retry-After
-# 429 is rate limiting; 500/502/503/504 are ordinary 5xx; 520-527 are
+# 429 is rate limiting; 500/502/503/504 are ordinary 5xx; 520-524 are
 # Cloudflare origin errors (524 = origin timed out). Generation time varies,
-# so a retry often finishes within the CF limit.
-RETRY_STATUS = {429, 500, 502, 503, 504} | set(range(520, 528))
+# so a retry often finishes within the CF limit. 525/526 (the origin's
+# certificate) don't go away by trying again.
+RETRY_STATUS = {429, 500, 502, 503, 504} | set(range(520, 525))
+# Image requests are paid for. These say the request was refused before any
+# work began, so it can be sent again freely; any other failure (a timeout,
+# a 500, a 524) may come after the image was made and billed, so a POST is
+# sent again at most UNCERTAIN_RETRIES times (one try more, as a relay's 524
+# often comes while the image is still being made).
+SAFE_RETRY_STATUS = {429, 502, 503, 520, 521, 522, 523}
+UNCERTAIN_RETRIES = 1
+# A 429 that means the account is out of credit doesn't pass by waiting
+QUOTA_CODES = {"insufficient_quota", "billing_hard_limit_reached"}
 
+# A downloaded image is at most this large (a result is a few MB)
+MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 # Timeouts are all (connect, read): short for connecting, long for waiting on
 # generation. Generating an image can take minutes, so the read timeout is
 # generous to avoid mistaking a normal generation for a failure.
@@ -203,7 +216,11 @@ def log(level: str, msg: str) -> None:
         msg = f"[{tag}] {msg}"
     sink = getattr(_job, "sink", None)
     if sink is not None:
-        sink(level, msg)
+        try:
+            sink(level, msg)
+        except Exception as exc:  # a log line must never cost a paid-for result
+            print(f"[warn] log sink failed ({type(exc).__name__}: {exc}); {msg}",
+                  file=sys.stderr)
         return
     if _USE_COLOR and level in _COLORS:
         prefix = f"{_COLORS[level]}[{level}]{_RESET}"
@@ -277,10 +294,11 @@ def read_env_file(path: Path) -> dict[str, str]:
 
 
 def get_setting(name: str, default: str = "") -> str:
-    """Read ``PROMPTBRUSH_<name>``: environment variable > .env > default."""
+    """Read ``PROMPTBRUSH_<name>``: environment variable > .env > default (a blank
+    value counts as unset)."""
     key = ENV_PREFIX + name
-    value = os.environ.get(key) or read_env_file(ENV_FILE).get(key)
-    return (value or default).strip()
+    value = (os.environ.get(key) or "").strip() or (read_env_file(ENV_FILE).get(key) or "").strip()
+    return value or default.strip()
 
 
 def load_api_key() -> str:
@@ -479,11 +497,23 @@ def _retry_after(resp: requests.Response) -> float:
     return min(max(seconds, 0), MAX_RETRY_AFTER) if math.isfinite(seconds) else 0
 
 
-def _retry_wait(reason: str, attempt: int, min_wait: float = 0) -> None:
-    """Log why we're retrying, then back off exponentially (at least ``min_wait`` s)."""
-    wait = max(RETRY_BACKOFF ** attempt, min_wait)
-    log("retry", f"{reason}, retrying in {wait:.0f}s ({attempt}/{MAX_RETRIES - 1})")
+def _retry_wait(reason: str, attempt: int, of: int, min_wait: float = 0) -> None:
+    """Log why we're retrying, then back off exponentially (at least ``min_wait`` s),
+    with up to a second of jitter so parallel requests don't retry in step."""
+    wait = max(RETRY_BACKOFF ** attempt, min_wait) + random.uniform(0, 1)
+    log("retry", f"{reason}, retrying in {wait:.0f}s ({attempt}/{of})")
     time.sleep(wait)
+
+
+def _refused_before_work(exc: Exception) -> bool:
+    """Whether a network failure came before the request reached the server: the
+    connection was never made (a timeout connecting, a refused port, a name that
+    didn't resolve)."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    text = repr(exc)
+    return isinstance(exc, requests.exceptions.ConnectionError) and (
+        "NewConnectionError" in text or "NameResolutionError" in text)
 
 
 def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
@@ -492,27 +522,49 @@ def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
 
     On a connection error, a timeout, or a retryable status code (see
     ``RETRY_STATUS``), back off and retry, waiting at least as long as the
-    server's Retry-After if it sends one. When the attempts run out, the last
-    response is returned or the last exception re-raised.
+    server's Retry-After if it sends one. A POST (a paid request) is retried
+    freely only when it was refused before any work began; after a failure
+    that may have come once the image was made, at most UNCERTAIN_RETRIES
+    times. Certificate and proxy errors, and an exhausted quota, aren't
+    retried. When the attempts run out, the last response is returned or the
+    last exception re-raised.
     """
-    last_exc: Exception | None = None
+    paid = method.upper() == "POST"
+    uncertain = 0
     for attempt in range(1, MAX_RETRIES + 1):
+        retry = attempt < MAX_RETRIES
         try:
             resp = requests.request(method, url, **kwargs)
-            if resp.status_code in RETRY_STATUS and attempt < MAX_RETRIES:
-                _retry_wait(f"HTTP {resp.status_code}", attempt,
-                            _retry_after(resp))
-                continue
-            return resp
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError,
+                requests.exceptions.InvalidHeader):
+            raise  # trying again changes nothing
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
                 requests.exceptions.ChunkedEncodingError) as exc:
-            last_exc = exc
-            if attempt < MAX_RETRIES:
-                _retry_wait(f"Connection error ({type(exc).__name__})", attempt)
+            if paid and not _refused_before_work(exc):
+                uncertain += 1
+                retry = retry and uncertain <= UNCERTAIN_RETRIES
+            if not retry:
+                raise
+            _retry_wait(f"Connection error ({type(exc).__name__})", attempt, MAX_RETRIES - 1)
+            continue
+        if resp.status_code not in RETRY_STATUS or not retry:
+            return resp
+        if resp.status_code == 429 and _error_code(_json_or_none(resp)) in QUOTA_CODES:
+            return resp
+        if paid and resp.status_code not in SAFE_RETRY_STATUS:
+            uncertain += 1
+            if uncertain > UNCERTAIN_RETRIES:
+                return resp
+        _retry_wait(f"HTTP {resp.status_code}", attempt, MAX_RETRIES - 1, _retry_after(resp))
+    raise AssertionError("unreachable")
 
-    log("error", f"Still failing after {MAX_RETRIES - 1} retries")
-    raise last_exc  # type: ignore[misc]
+
+def _json_or_none(resp: requests.Response) -> object:
+    try:
+        return resp.json()
+    except ValueError:
+        return None
 
 
 class ImageAPIError(Exception):
@@ -528,6 +580,9 @@ class ImageAPIError(Exception):
         super().__init__(message)
         self.status = status
         self.code = code  # the body's error.code, when it has one
+
+    def __reduce__(self):  # picklable, for a process pool
+        return type(self), (str(self), self.status, self.code)
 
     @property
     def moderated(self) -> bool:
@@ -564,16 +619,35 @@ def _item_bytes(item: dict) -> bytes | None:
     if b64 and isinstance(b64, str):
         data = base64.b64decode(b64)
     elif url and isinstance(url, str):
-        log("info", f"Downloading image: {url}")
-        resp = request_with_retry("GET", url, timeout=TIMEOUT_DOWNLOAD)
-        resp.raise_for_status()
-        data = resp.content
+        if not url.lower().startswith(("https://", "http://")):
+            raise ValueError("not an http(s) link")
+        # the link without its query: a signed link's signature stays out of the log
+        log("info", f"Downloading image: {url.split('?', 1)[0]}")
+        data = _download(url)
     else:
         return None
     # what an expired link or a relay's error page answers with, rather than an image
     if detect_image_ext(data) is None:
-        raise ValueError(f"not an image: {_brief(data.decode('utf-8', 'replace'))}")
+        raise ValueError(f"not an image ({len(data):,} bytes)")
     return data
+
+
+def _download(url: str) -> bytes:
+    """GET an image link, at most MAX_DOWNLOAD_BYTES (redirects only to http(s))."""
+    with request_with_retry("GET", url, timeout=TIMEOUT_DOWNLOAD, stream=True) as resp:
+        resp.raise_for_status()
+        if not resp.url.lower().startswith(("https://", "http://")):
+            raise ValueError("redirected away from http(s)")
+        length = resp.headers.get("Content-Length", "")
+        if length.isdigit() and int(length) > MAX_DOWNLOAD_BYTES:
+            raise ValueError(f"too large ({int(length):,} bytes)")
+        chunks, total = [], 0
+        for chunk in resp.iter_content(1 << 16):
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"too large (over {MAX_DOWNLOAD_BYTES:,} bytes)")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def decode_images(result: dict) -> list[bytes]:
@@ -661,7 +735,12 @@ def _post_images(url: str, **kwargs) -> Generation:
                     f"output={usage.get('output_tokens', 'N/A')}")
     else:
         usage = None
-    return Generation(decode_images(result), usage, elapsed)
+    images = decode_images(result)
+    if not images:
+        # every item failed (expired links, an error page): paid for, but nothing to show
+        raise ImageAPIError("The response's images couldn't be retrieved (see the log)",
+                            resp.status_code, NO_IMAGE)
+    return Generation(images, usage, elapsed)
 
 
 def _moderation_hint(model: str) -> str:
@@ -784,7 +863,10 @@ def create_image(
         raise ValueError("mask must be a PNG image")
     check_size(model, size)
 
-    headers = {"Authorization": f"Bearer {api_key or load_api_key()}"}
+    key = (api_key or load_api_key()).strip()
+    if not key.isprintable() or any(c.isspace() for c in key):
+        raise ValueError("The API key contains spaces or control characters")  # never echoed
+    headers = {"Authorization": f"Bearer {key}"}
     gen_url, edit_url = api_endpoints(base_url)
     if not images:
         payload = {"model": model, "prompt": prompt, "n": 1, "size": size}
